@@ -172,12 +172,12 @@ export DISPLAY=:99
 
 **Jalankan VNC server (untuk akses visual):**
 ```bash
-# Tanpa password (hanya jika jaringan benar-benar terisolasi — TIDAK disarankan di produksi)
-x11vnc -display :99 -rfbport 5900 -forever -shared -nopw &
+# DISARANKAN: dengan password (simpan di file aman, mis. ~/.hermes/.vncpass)
+x11vnc -storepasswd YOUR_VNC_PASSWORD ~/.hermes/.vncpass
+x11vnc -display :99 -rfbauth ~/.hermes/.vncpass -rfbport 5900 -forever -shared &
 
-# ATAU dengan password (DISARANKAN)
-x11vnc -storepasswd YOUR_VNC_PASSWORD /tmp/vncpass
-x11vnc -display :99 -rfbauth /tmp/vncpass -rfbport 5900 -forever -shared &
+# TIDAK disarankan di produksi: tanpa password (hanya jika terisolasi total)
+# x11vnc -display :99 -rfbport 5900 -forever -shared -nopw &
 ```
 
 **Jalankan noVNC (akses via browser):**
@@ -266,7 +266,19 @@ Harapan: `authorized on YOUR_BROKER_SERVER`
 
 ### Step 7 — Install Expert Advisor (EA)
 
-#### 7a. Copy file EA
+#### 7a. Copy file EA + indikator prasyarat
+
+Beberapa EA butuh **indikator custom** terpasang dulu (selain EA itu sendiri):
+- **SMC_ICT_Master** membutuhkan `PivotSuperTrend.ex5` dan `MarketStructure_SMC.ex5` di folder `Indicators/`.
+- **ForexScalper / GoldScalper** membutuhkan indikator bawaan MT5 (Super Trend, MACD) — tidak perlu install tambahan.
+
+Letakkan indikator custom ke:
+```bash
+INDIR="$HOME/.mt5/drive_c/Program Files/MetaTrader 5/MQL5/Indicators"
+cp PivotSuperTrend.ex5 MarketStructure_SMC.ex5 "$INDIR/"
+```
+
+Lalu copy EA:
 ```bash
 EADIR="$HOME/.mt5/drive_c/Program Files/MetaTrader 5/MQL5/Experts"
 cp SMC_ICT_Master.mq5 "$EADIR/"
@@ -365,35 +377,69 @@ mkdir -p ~/.hermes/scripts ~/.hermes/logs
 **`~/.hermes/scripts/mt5-start.sh`:**
 ```bash
 #!/bin/bash
-set -e
+# MetaTrader 5 auto-start script
+# Starts terminal64.exe under an existing/reusable Xvfb display.
+#
+# PENTING: Xvfb dan x11vnc dianggap PERSISTENT — TIDAK dibunuh saat exit.
+# Mematikan Xvfb saat MT5 sedang jalan memutus koneksi X MT5 dan memicu
+# crash loop. Hanya MT5 + wineserver yang dibersihkan saat exit.
+
 export DISPLAY=:99
 export WINEPREFIX=$HOME/.mt5
 MT5_EXE="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 LOGFILE=$HOME/.hermes/logs/mt5.log
 mkdir -p "$(dirname "$LOGFILE")"
 
+# --- Cleanup: HANYA MT5 + wineserver. JANGAN kill Xvfb. ---
 cleanup() {
-    echo "[$(date)] Stopping..." >> "$LOGFILE"
+    echo "[$(date)] Stopping MT5 (Xvfb dibiarkan nyala)..." >> "$LOGFILE"
     pkill -f "terminal64.exe" 2>/dev/null || true
-    pkill -f "msedgewebview2.exe" 2>/dev/null || true
-    pkill -f x11vnc 2>/dev/null || true
-    pkill -f "Xvfb :99" 2>/dev/null || true
     wineserver -k 2>/dev/null || true
 }
 trap cleanup EXIT
-cleanup 2>/dev/null || true; sleep 2
 
-Xvfb :99 -screen 0 1024x768x24 &>/dev/null &
-sleep 1
-x11vnc -display :99 -rfbport 5900 -forever -shared -nopw &>/dev/null &
-sleep 1
+# --- Pastikan Xvfb nyala (reuse kalau sudah jalan, start kalau belum) ---
+if ! pgrep -f "Xvfb :99" >/dev/null 2>&1; then
+    echo "[$(date)] Starting Xvfb..." >> "$LOGFILE"
+    Xvfb :99 -screen 0 1024x768x24 -ac -nolisten tcp &>/dev/null &
+    sleep 2
+else
+    echo "[$(date)] Xvfb sudah nyala, reuse" >> "$LOGFILE"
+fi
+
+# --- Pastikan x11vnc nyala (password protected) ---
+if ! pgrep -f "x11vnc" >/dev/null 2>&1; then
+    echo "[$(date)] Starting x11vnc (password protected)..." >> "$LOGFILE"
+    x11vnc -display :99 -rfbport 5900 -forever -shared -rfbauth $HOME/.hermes/.vncpass &>/dev/null &
+    sleep 1
+fi
+
+# --- Bunuh MT5 instance lama (bukan Xvfb) agar start bersih ---
+pkill -f "terminal64.exe" 2>/dev/null || true
+wineserver -k 2>/dev/null || true
+sleep 2
+
+# --- Start MT5 ---
+echo "[$(date)] Starting MetaTrader 5..." >> "$LOGFILE"
 wine "$MT5_EXE" >> "$LOGFILE" 2>&1 &
 MT5_PID=$!; sleep 3
 if kill -0 $MT5_PID 2>/dev/null; then
-    echo "[$(date)] Started (PID: $MT5_PID)" >> "$LOGFILE"
+    echo "[$(date)] MT5 started (PID: $MT5_PID)" >> "$LOGFILE"
 else
     echo "[$(date)] FAILED to start" >> "$LOGFILE"; exit 1
 fi
+
+# --- Coba enable Algo Trading (Ctrl+E) best-effort ---
+# CATATAN: xdotool Ctrl+E tidak reliable di wine headless.
+# Guard auto-trading juga ditangani oleh watchdog terpisah (restart-on-off).
+sleep 15
+WIN=$(xdotool search --class "terminal64.exe" 2>/dev/null | head -1)
+if [ -n "$WIN" ]; then
+    xdotool windowactivate --sync "$WIN" 2>/dev/null
+    xdotool key --delay 100 "ctrl+e" 2>/dev/null
+    echo "[$(date)] Sent Ctrl+E to enable Algo Trading" >> "$LOGFILE"
+fi
+
 wait $MT5_PID
 ```
 ```bash
@@ -637,8 +683,9 @@ Lihat juga [Section 8](#8-troubleshooting--error-umum) untuk daftar lengkap. Alu
 | EA tidak trade | Filter sesi pakai `TimeGMT()` (off UTC) | Ganti ke `TimeCurrent()` |
 | `Invalid stops` | Min stop distance dilanggar | Normalisasi dengan `NormalizeDouble()` |
 | EA dobel entry | Tidak ada cek `CountPositions()` | Tambah guard + cooldown |
-| MT5 tidak reconnect | WebView2/terminal stuck | Kill + wineserver -k, lalu restart |
-| VNC layar hitam | Xvfb mati | `ps aux \| grep Xvfb`; nyalakan ulang |
+| MT5 tidak reconnect | Restart: kill WebView2 + terminal + wineserver |
+| MT5 crash loop saat restart | Jangan kill Xvfb saat MT5 jalan — putus koneksi X → crash. Biarkan Xvfb persistent |
+| VNC layar hitam | `ps aux \| grep Xvfb`; nyalakan ulang |
 | Port tak terakses | Firewall provider tutup | Buka di console provider |
 | Log acak/ilang | Encoding UTF-16LE | `tr -d '\0'` atau `iconv -f UTF-16LE -t UTF-8` |
 | `wine --version` hang | Init prefix pertama | Tunggu ~30s, jangan timeout |
@@ -725,8 +772,9 @@ if(CountPositions() > 0) return;
 | EA gak trade | Cek filter sesi pakai `TimeCurrent()`, bukan `TimeGMT()` |
 | `Invalid stops` | Cek min stop distance, `NormalizeDouble()` |
 | EA duplikat entry | Tambah `CountPositions()>0` + cooldown |
-| MT5 tak reconnect | Restart: kill WebView2 + terminal + wineserver |
-| VNC black screen | `ps aux \| grep Xvfb` |
+| MT5 tidak reconnect | Restart: kill WebView2 + terminal + wineserver |
+| MT5 crash loop saat restart | Jangan kill Xvfb saat MT5 jalan — putus koneksi X → crash. Biarkan Xvfb persistent |
+| VNC layar hitam | `ps aux \| grep Xvfb`; nyalakan ulang |
 | Port tak akses | Buka di firewall provider |
 | Log tak terbaca | Encoding UTF-16LE → `tr -d '\0'` / `iconv` |
 | `wine --version` hang | Init prefix ~30s, jangan timeout |
